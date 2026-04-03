@@ -1,21 +1,25 @@
-const express = require('express')
-const router  = express.Router()
-const Animal  = require('../models/Animal')
+const express  = require('express')
+const router   = express.Router()
+const Animal   = require('../models/Animal')
+const protect  = require('../middleware/auth')
 
-// GET all animals
-router.get('/', async (_req, res) => {
+// All routes protected — user must be logged in
+router.use(protect)
+
+// GET /api/animals — only this user's animals
+router.get('/', async (req, res) => {
   try {
-    const animals = await Animal.find().sort({ type: 1, name: 1 })
+    const animals = await Animal.find({ userId: req.user._id }).sort({ type: 1, name: 1 })
     res.json(animals)
   } catch (err) {
     res.status(500).json({ message: err.message })
   }
 })
 
-// GET single animal
+// GET /api/animals/:id
 router.get('/:id', async (req, res) => {
   try {
-    const animal = await Animal.findById(req.params.id)
+    const animal = await Animal.findOne({ _id: req.params.id, userId: req.user._id })
     if (!animal) return res.status(404).json({ message: 'Animal not found' })
     res.json(animal)
   } catch (err) {
@@ -23,33 +27,40 @@ router.get('/:id', async (req, res) => {
   }
 })
 
-// POST create animal
+// POST /api/animals — add new animal
 router.post('/', async (req, res) => {
   try {
-    const animal = new Animal(req.body)
-    const saved  = await animal.save()
-    res.status(201).json(saved)
+    // auto-set emoji based on type
+    const emojiMap = { cow: '🐄', bull: '🐂', calf: '🐮' }
+    const emoji = emojiMap[req.body.type] || '🐄'
+    const animal = await Animal.create({ ...req.body, userId: req.user._id, emoji })
+    res.status(201).json(animal)
   } catch (err) {
     res.status(400).json({ message: err.message })
   }
 })
 
-// PUT update animal
+// PUT /api/animals/:id
 router.put('/:id', async (req, res) => {
   try {
-    const updated = await Animal.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true })
-    if (!updated) return res.status(404).json({ message: 'Animal not found' })
-    res.json(updated)
+    const animal = await Animal.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user._id },
+      { $set: req.body },
+      { new: true, runValidators: true }
+    )
+    if (!animal) return res.status(404).json({ message: 'Animal not found' })
+    res.json(animal)
   } catch (err) {
     res.status(400).json({ message: err.message })
   }
 })
 
-// DELETE animal
+// DELETE /api/animals/:id
 router.delete('/:id', async (req, res) => {
   try {
-    await Animal.findByIdAndDelete(req.params.id)
-    res.json({ message: 'Deleted' })
+    const animal = await Animal.findOneAndDelete({ _id: req.params.id, userId: req.user._id })
+    if (!animal) return res.status(404).json({ message: 'Animal not found' })
+    res.json({ message: 'Deleted', id: req.params.id })
   } catch (err) {
     res.status(500).json({ message: err.message })
   }

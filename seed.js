@@ -1,12 +1,8 @@
-/**
- * seed.js — run once to populate the database with the starter herd.
- * Usage (from project root):  node server/seed.js
- * Usage (from server/ folder): node seed.js
- */
 const path = require('path')
 require('dotenv').config({ path: path.join(__dirname, '.env') })
 const mongoose = require('mongoose')
 const Animal   = require('./models/Animal')
+const User     = require('./models/User')
 
 const ANIMALS = [
   { name:'Daisy',   type:'cow',  breed:'Friesian',       age:'4 yrs', sex:'F', emoji:'🐄', status:'healthy' },
@@ -31,11 +27,26 @@ async function seed() {
   await mongoose.connect(uri)
   console.log('✅  Connected to MongoDB')
 
-  await Animal.deleteMany({})
-  console.log('🗑   Cleared existing animals')
+  // Create or find demo user
+  let demoUser = await User.findOne({ email: 'demo@farmwise.app' })
+  if (!demoUser) {
+    demoUser = await User.create({
+      name: 'Demo Farmer',
+      email: 'demo@farmwise.app',
+      password: 'farmwise123',
+      farm: 'FarmWise Demo Farm',
+    })
+    console.log('✅  Demo user created — email: demo@farmwise.app  password: farmwise123')
+  } else {
+    console.log('ℹ️   Demo user already exists')
+  }
 
-  const created = await Animal.insertMany(ANIMALS)
-  console.log(`✅  Seeded ${created.length} animals`)
+  await Animal.deleteMany({ userId: demoUser._id })
+  console.log('🗑   Cleared demo animals')
+
+  const withUser = ANIMALS.map(a => ({ ...a, userId: demoUser._id }))
+  const created  = await Animal.insertMany(withUser)
+  console.log(`✅  Seeded ${created.length} animals for demo user`)
 
   await mongoose.disconnect()
   process.exit(0)
