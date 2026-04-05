@@ -1,19 +1,28 @@
-const express  = require('express')
-const router   = express.Router()
-const multer   = require('multer')
-const axios    = require('axios')
-const Animal   = require('../models/Animal')
+const express    = require('express')
+const router     = express.Router()
+const multer     = require('multer')
+const axios      = require('axios')
+const Animal     = require('../models/Animal')
 const HealthScan = require('../models/HealthScan')
-const protect  = require('../middleware/auth')
+const protect    = require('../middleware/auth')
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 10 * 1024 * 1024 },   // 10 MB max
+})
 
-// OpenRouter call — supports vision models (free tier available)
-async function callOpenRouter(messages, systemPrompt) {
+// ── OpenRouter helper ────────────────────────────────────────
+async function callOpenRouter(messages, systemPrompt, isVision = false) {
+  // Vision scan → use vision-capable model
+  // Text only   → use lighter text model
+  const model = isVision
+    ? (process.env.OPENROUTER_MODEL      || 'nvidia/nemotron-nano-12b-v2-vl:free')
+    : (process.env.OPENROUTER_MODEL_TEXT || 'arcee-ai/trinity-large-preview:free')
+
   const response = await axios.post(
     'https://openrouter.ai/api/v1/chat/completions',
     {
-      model: process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.2-11b-vision-instruct:free',
+      model,
       messages: [
         { role: 'system', content: systemPrompt },
         ...messages,
@@ -23,35 +32,74 @@ async function callOpenRouter(messages, systemPrompt) {
     },
     {
       headers: {
-        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        Authorization:  `Bearer ${process.env.OPENROUTER_API_KEY}`,
         'Content-Type': 'application/json',
-        'HTTP-Referer': process.env.APP_URL || 'https://farmwise-henna.vercel.app',
-        'X-Title': 'FarmWise',
+        'HTTP-Referer':  process.env.APP_URL || 'https://farmwise-henna.vercel.app',
+        'X-Title':       'FarmWise',
       },
+      timeout: 55000,
     }
   )
-  return response.data.choices[0].message.content
+
+  // Some free reasoning models put the answer in .reasoning instead of .content
+  const msg = response.data.choices[0].message
+  return msg.content || msg.reasoning || ''
+}
+
+// ── Extract JSON safely ───────────────────────────────────────
+function extractJSON(raw) {
+  try { return JSON.parse(raw.trim()) } catch {}
+
+  const fenced = raw.replace(/```json|```/g, '').trim()
+  try { return JSON.parse(fenced) } catch {}
+
+  const start = raw.indexOf('{')
+  const end   = raw.lastIndexOf('}')
+  if (start !== -1 && end !== -1) {
+    try { return JSON.parse(raw.slice(start, end + 1)) } catch {}
+  }
+
+  throw new Error('Model did not return valid JSON. Please try again.')
+}
+
+// ── Fallback result when model fails ─────────────────────────
+function fallbackResult(scanType, animalName) {
+  return {
+    status:          'warning',
+    condition:       'Analysis incomplete',
+    finding:         `Could not fully analyse the ${scanType} photo of ${animalName}. Please retake in bright daylight, 30–50 cm from the area.`,
+    severity:        3,
+    recommendations: [
+      'Retake the photo in bright outdoor light',
+      'Hold the camera steady and close to the area',
+      'Consult a local vet if symptoms are visible',
+    ],
+    food:       { remove: ['Excess wet grass'], add: ['Fresh clean water', 'Quality dry hay'] },
+    urgency:    'monitor',
+    prevention: 'Regular fortnightly health checks catch problems early.',
+  }
 }
 
 router.use(protect)
 
-// POST /api/health/scan
+// POST /api/health/scan ────────────────────────────────────────
 router.post('/scan', upload.single('image'), async (req, res) => {
+  const { animalId, scanType, location } = req.body
+  const file = req.file
+
+  if (!file)     return res.status(400).json({ message: 'No image uploaded' })
+  if (!animalId) return res.status(400).json({ message: 'animalId is required' })
+
   try {
-    const { animalId, scanType, location } = req.body
-    const file = req.file
-
-    if (!file)     return res.status(400).json({ message: 'No image uploaded' })
-    if (!animalId) return res.status(400).json({ message: 'animalId required' })
-
     const animal = await Animal.findOne({ _id: animalId, userId: req.user._id })
     if (!animal) return res.status(404).json({ message: 'Animal not found' })
 
     const b64       = file.buffer.toString('base64')
     const mediaType = file.mimetype
+    const farm      = location || 'Kenya'
 
-    const systemPrompt = `You are a fast expert livestock vet AI for Kenyan smallholder farmers near ${location || 'Kenya'}.
-Analyse the photo quickly and return ONLY valid JSON — no markdown, no extra text.
+    const systemPrompt = `You are a fast expert livestock vet AI for Kenyan smallholder farmers near ${farm}.
+Analyse the photo and return ONLY valid JSON — no markdown, no preamble. Start with {
 Schema:
 {
   "status": "healthy|warning|critical",
@@ -68,27 +116,34 @@ Schema:
       role: 'user',
       content: [
         {
-          type: 'image_url',
+          type:      'image_url',
           image_url: { url: `data:${mediaType};base64,${b64}` },
         },
         {
           type: 'text',
-          text: `${scanType} scan of ${animal.type} "${animal.name}" — ${animal.breed}, ${animal.age}, ${animal.sex === 'M' ? 'male' : 'female'}. Farm: ${location || 'Kenya'}. Give accurate health assessment.`,
+          text: `${scanType} scan of ${animal.type} "${animal.name}" — ${animal.breed}, ${animal.age}, ${animal.sex === 'M' ? 'male' : 'female'}. Farm: ${farm}. Give accurate health assessment.`,
         },
       ],
     }
 
-    const raw    = await callOpenRouter([userMessage], systemPrompt)
-    const clean  = raw.replace(/```json|```/g, '').trim()
-    const result = JSON.parse(clean)
+    let result
+    try {
+      const raw = await callOpenRouter([userMessage], systemPrompt, true)
+      result    = extractJSON(raw)
+    } catch (modelErr) {
+      console.warn('Vision model failed, using fallback:', modelErr.message)
+      result = fallbackResult(scanType, animal.name)
+    }
 
+    // Persist scan to DB
     const scan = await HealthScan.create({
       animalId,
       scanType,
-      location: location || '',
+      location: farm,
       ...result,
     })
 
+    // Auto-update animal status if flagged
     if (result.status !== 'healthy') {
       await Animal.findByIdAndUpdate(animalId, { status: result.status })
     }
@@ -100,22 +155,26 @@ Schema:
   }
 })
 
-// GET /api/health/history/:animalId
+// GET /api/health/history/:animalId ───────────────────────────
 router.get('/history/:animalId', async (req, res) => {
   try {
-    const scans = await HealthScan.find({ animalId: req.params.animalId })
-      .sort({ createdAt: -1 }).limit(20)
+    const scans = await HealthScan
+      .find({ animalId: req.params.animalId })
+      .sort({ createdAt: -1 })
+      .limit(20)
     res.json(scans)
   } catch (err) {
     res.status(500).json({ message: err.message })
   }
 })
 
-// GET /api/health/recent
+// GET /api/health/recent ──────────────────────────────────────
 router.get('/recent', async (req, res) => {
   try {
-    const scans = await HealthScan.find()
-      .sort({ createdAt: -1 }).limit(10)
+    const scans = await HealthScan
+      .find()
+      .sort({ createdAt: -1 })
+      .limit(10)
       .populate('animalId', 'name breed emoji')
     res.json(scans)
   } catch (err) {
